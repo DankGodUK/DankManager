@@ -60,15 +60,7 @@ def build_signup_embed(event: Event, preset: BuildPreset | None, signups: list[S
             by_type = {}
             for s in party_signups:
                 r_name = s.assigned_role or s.requested_role.split(",")[0]
-
-                if r_name.startswith("[Tank]"):
-                    r_type = "Tank"
-                elif r_name.startswith("[Healer]"):
-                    r_type = "Healer"
-                elif r_name.startswith("[Support]"):
-                    r_type = "Support"
-                else:
-                    r_type = "DPS")
+                r_type = role_type_map.get(r_name, "DPS")
                 by_type.setdefault(r_type, []).append((s, r_name))
                 
             field_lines = []
