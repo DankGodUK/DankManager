@@ -3,28 +3,100 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from db.engine import async_session
-from db.models import Event, Signup, SignupStatus, BuildPreset
+from db.models import Event, Signup, SignupStatus, BuildPreset, EventStatus
 
+
+# You can replace these with custom server emojis!
+# For example, to use a custom Tank icon, replace "🛡️" with "<:Tank:1234567890>" 
+# (You can get the exact string by typing \:EmojiName: in Discord)
+ICONS = {
+    "Tank": "🛡️",
+    "DPS": "⚔️",
+    "Healer": "⚕️",
+    "Support": "🪈",
+}
 
 def build_signup_embed(event: Event, preset: BuildPreset | None, signups: list[Signup]) -> discord.Embed:
+    
+    status_text = f"**Starts:** <t:{int(event.start_time.timestamp())}:F>  (<t:{int(event.start_time.timestamp())}:R>)"
+    color = discord.Color.orange()
+    title = f"📋 {event.title}  (Event #{event.id})"
+    
+    if event.status == EventStatus.CANCELLED:
+        status_text = "**Starts:** ❌ **CANCELLED**"
+        color = discord.Color.red()
+        title = f"❌ [CANCELLED] {event.title}  (Event #{event.id})"
+        
     embed = discord.Embed(
-        title=f"📋 {event.title}  (Event #{event.id})",
-        description=f"**Type:** {event.content_type}\n**Starts:** <t:{int(event.start_time.timestamp())}:F>  (<t:{int(event.start_time.timestamp())}:R>)",
-        color=discord.Color.orange(),
+        title=title,
+        description=f"**Type:** {event.content_type}\n{status_text}",
+        color=color,
     )
+
     if preset:
         embed.add_field(name="Build", value=f"{preset.name} ({preset.size}-man)", inline=False)
+        
+        # We need a quick way to map a role_name to its role_type for the signups
+        role_type_map = {}
+        for slot in preset.slots:
+            role_type_map[slot.role_name] = getattr(slot, 'role_type', 'DPS') or 'DPS'
+
+        accepted_signups = [s for s in signups if s.status == SignupStatus.ACCEPTED]
+        
+        # Group by party
+        parties = {}
+        for s in accepted_signups:
+            p_num = s.party_number or 0
+            parties.setdefault(p_num, []).append(s)
+            
+        # Define order
+        role_order = {"Tank": 0, "Healer": 1, "Support": 2, "DPS": 3}
+        
+        for p_num in sorted(parties.keys()):
+            party_name = f"Party {p_num}" if p_num > 0 else "Unassigned / Roster"
+            party_signups = parties[p_num]
+            
+            # Group by role_type within party
+            by_type = {}
+            for s in party_signups:
+                r_name = s.assigned_role or s.requested_role.split(",")[0]
+                r_type = role_type_map.get(r_name, "DPS")
+                by_type.setdefault(r_type, []).append((s, r_name))
+                
+            field_lines = []
+            for r_type in sorted(by_type.keys(), key=lambda t: role_order.get(t, 99)):
+                icon = ICONS.get(r_type, "🔸")
+                players = []
+                for s, r_name in by_type[r_type]:
+                    players.append(f"<@{s.user_id}> ({r_name})")
+                field_lines.append(f"{icon} **{r_type}**: {', '.join(players)}")
+                
+            if field_lines:
+                embed.add_field(name=party_name, value="\n".join(field_lines)[:1024], inline=False)
+                
+        # Also let's list the Missing / Pending summary!
+        missing_lines = []
         for slot in sorted(preset.slots, key=lambda s: s.order):
-            accepted = [s for s in signups if s.status == SignupStatus.ACCEPTED and (s.assigned_role or s.requested_role) == slot.role_name]
-            pending = [s for s in signups if s.status == SignupStatus.PENDING and s.requested_role == slot.role_name]
-            value = f"{len(accepted)}/{slot.count} filled"
-            if pending:
-                value += f" ({len(pending)} pending)"
-            embed.add_field(name=slot.role_name, value=value, inline=True)
+            accepted_count = len([s for s in accepted_signups if (s.assigned_role or s.requested_role.split(",")[0]) == slot.role_name])
+            if accepted_count < slot.count:
+                pending = [s for s in signups if s.status == SignupStatus.PENDING and slot.role_name in [r.strip() for r in s.requested_role.split(",")]]
+                p_text = f", {len(pending)} pending" if pending else ""
+                missing_lines.append(f"**{slot.role_name}**: {accepted_count}/{slot.count}{p_text}")
+                
+        if missing_lines:
+            # Chunk it if it's too long
+            missing_text = "\n".join(missing_lines)
+            if len(missing_text) > 1024:
+                missing_text = missing_text[:1020] + "..."
+            embed.add_field(name="Slots Needed", value=missing_text, inline=False)
+
     if event.voice_channel_id:
         embed.add_field(name="Voice Channel", value=f"<#{event.voice_channel_id}>", inline=False)
-    embed.set_footer(text="Click Sign Up to pick a role. Officers: use /signup accept or /signup decline.")
+
+    embed.set_footer(text="Click Sign Up to pick a role. Officers: use the Review Pending button.")
     return embed
+
+
 
 
 class RoleSelect(discord.ui.Select):
@@ -33,11 +105,11 @@ class RoleSelect(discord.ui.Select):
             discord.SelectOption(label=slot.role_name[:100], description=(slot.notes or "")[:100] or None)
             for slot in sorted(preset.slots, key=lambda s: s.order)
         ][:25]
-        super().__init__(placeholder="Choose the role/build you want to sign up for...", options=options, custom_id=f"role_select:{event_id}")
+        super().__init__(placeholder="Choose the role(s) you want to sign up for...", options=options, custom_id=f"role_select:{event_id}", max_values=min(len(options), 5) if options else 1)
         self.event_id = event_id
 
     async def callback(self, interaction: discord.Interaction):
-        role_name = self.values[0]
+        requested_roles = ",".join(self.values)
         async with async_session() as session:
             result = await session.execute(
                 select(Event).options(selectinload(Event.signups)).where(Event.id == self.event_id)
@@ -49,7 +121,7 @@ class RoleSelect(discord.ui.Select):
 
             existing = next((s for s in event.signups if s.user_id == interaction.user.id), None)
             if existing:
-                existing.requested_role = role_name
+                existing.requested_role = requested_roles
                 existing.status = SignupStatus.PENDING
                 existing.display_name = interaction.user.display_name
             else:
@@ -57,12 +129,12 @@ class RoleSelect(discord.ui.Select):
                     event_id=event.id,
                     user_id=interaction.user.id,
                     display_name=interaction.user.display_name,
-                    requested_role=role_name,
+                    requested_role=requested_roles,
                 ))
             await session.commit()
 
         await interaction.response.send_message(
-            f"✅ Signed up for **{role_name}** on **{self.view.event_title}**. Waiting for officer approval.",
+            f"✅ Signed up for **{requested_roles}** on **{self.view.event_title}**. Waiting for officer approval.",
             ephemeral=True,
         )
         await self.view.refresh_message(interaction)
@@ -79,7 +151,7 @@ class RoleSelectView(discord.ui.View):
     async def refresh_message(self, interaction: discord.Interaction):
         async with async_session() as session:
             result = await session.execute(
-                select(Event).options(selectinload(Event.signups), selectinload(Event.preset)).where(Event.id == int(self.children[0].custom_id.split(":")[1]))
+                select(Event).options(selectinload(Event.signups), selectinload(Event.preset).selectinload(BuildPreset.slots)).where(Event.id == int(self.children[0].custom_id.split(":")[1]))
             )
             event = result.scalar_one_or_none()
             if event is None:
@@ -91,6 +163,94 @@ class RoleSelectView(discord.ui.View):
             pass
 
 
+from utils.permissions import is_event_manager
+
+class ReviewActionView(discord.ui.View):
+    def __init__(self, event_id: int, target_user_id: int, parent_message: discord.Message, requested_roles: str):
+        super().__init__(timeout=120)
+        self.event_id = event_id
+        self.target_user_id = target_user_id
+        self.parent_message = parent_message
+        self.requested_roles = [r.strip() for r in requested_roles.split(",")]
+        
+        party_options = [
+            discord.SelectOption(label="Unassigned (No Party)", value="0"),
+            discord.SelectOption(label="Party 1", value="1"),
+            discord.SelectOption(label="Party 2", value="2"),
+            discord.SelectOption(label="Party 3", value="3"),
+            discord.SelectOption(label="Party 4", value="4"),
+            discord.SelectOption(label="Party 5", value="5"),
+        ]
+        
+        self.party_select = discord.ui.Select(placeholder="Select Party (Defaults to Unassigned)", options=party_options, min_values=1, max_values=1, row=0)
+        self.party_select.callback = self.party_callback
+        self.add_item(self.party_select)
+        self.selected_party = None
+        
+        for i, role in enumerate(self.requested_roles[:4]):
+            btn = discord.ui.Button(label=f"Accept as {role}"[:80], style=discord.ButtonStyle.success, row=1)
+            btn.callback = self.make_accept_callback(role)
+            self.add_item(btn)
+            
+        decline_btn = discord.ui.Button(label="Decline", style=discord.ButtonStyle.danger, row=1)
+        decline_btn.callback = self.decline_callback
+        self.add_item(decline_btn)
+        
+    async def party_callback(self, interaction: discord.Interaction):
+        if self.party_select.values[0] == "0":
+            self.selected_party = None
+        else:
+            self.selected_party = int(self.party_select.values[0])
+        # Need to acknowledge the interaction but keep the view
+        await interaction.response.defer()
+
+    def make_accept_callback(self, role_name: str):
+        async def callback(interaction: discord.Interaction):
+            await self.process_review(interaction, SignupStatus.ACCEPTED, role_name, self.selected_party)
+        return callback
+
+    async def decline_callback(self, interaction: discord.Interaction):
+        await self.process_review(interaction, SignupStatus.DECLINED)
+
+    async def process_review(self, interaction: discord.Interaction, status: SignupStatus, role_name: str = None, party_number: int = None):
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(Event).options(selectinload(Event.signups), selectinload(Event.preset).selectinload(BuildPreset.slots)).where(Event.id == self.event_id)
+            )
+            event = result.scalar_one_or_none()
+            if not event:
+                await interaction.response.edit_message(content="❌ Event not found.", view=None)
+                return
+            
+            signup = next((s for s in event.signups if s.user_id == self.target_user_id), None)
+            if not signup:
+                await interaction.response.edit_message(content="❌ Signup not found.", view=None)
+                return
+                
+            signup.status = status
+            if status == SignupStatus.ACCEPTED:
+                signup.assigned_role = role_name
+                signup.party_number = party_number
+            await session.commit()
+            
+        verb = "Accepted" if status == SignupStatus.ACCEPTED else "Declined"
+        await interaction.response.edit_message(content=f"✅ {verb} <@{self.target_user_id}>" + (f" as {role_name}" if role_name else "") + ".", view=None)
+        
+        try:
+            target_member = interaction.guild.get_member(self.target_user_id) or await interaction.guild.fetch_member(self.target_user_id)
+            if status == SignupStatus.ACCEPTED:
+                await target_member.send(f"✅ You've been accepted for **{event.title}** as **{role_name}**! Ask an officer to confirm your party via `/party view`.")
+            else:
+                await target_member.send(f"Your signup for **{event.title}** was declined.")
+        except discord.HTTPException:
+            pass
+            
+        try:
+            await self.parent_message.edit(embed=build_signup_embed(event, event.preset, event.signups))
+        except discord.HTTPException:
+            pass
+
 class EventSignupView(discord.ui.View):
     """Persistent view attached to the main event post."""
     def __init__(self, event_id: int):
@@ -99,6 +259,7 @@ class EventSignupView(discord.ui.View):
         # custom_id embeds event_id so this works across restarts once re-added in on_ready
         self.sign_up.custom_id = f"event_signup:{event_id}"
         self.withdraw.custom_id = f"event_withdraw:{event_id}"
+        self.review_pending.custom_id = f"event_review_pending:{event_id}"
 
     @discord.ui.button(label="Sign Up", style=discord.ButtonStyle.success, emoji="⚔️")
     async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -146,3 +307,30 @@ class EventSignupView(discord.ui.View):
             await interaction.message.edit(embed=build_signup_embed(event, event.preset, event.signups))
         except discord.HTTPException:
             pass
+
+    @discord.ui.button(label="Review Pending", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def review_pending(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with async_session() as session:
+            result = await session.execute(
+                select(Event).options(selectinload(Event.signups)).where(Event.id == self.event_id)
+            )
+            event = result.scalar_one_or_none()
+            if event is None:
+                await interaction.response.send_message("❌ Event not found.", ephemeral=True)
+                return
+            
+            if not await is_event_manager(interaction.user, event):
+                await interaction.response.send_message("❌ You don't have permission to review signups.", ephemeral=True)
+                return
+                
+            pending = [s for s in event.signups if s.status == SignupStatus.PENDING]
+            if not pending:
+                await interaction.response.send_message("No pending signups.", ephemeral=True)
+                return
+                
+            batch = pending[:10]
+            await interaction.response.send_message(f"Loading {len(batch)} pending signups to review (click again for more)...", ephemeral=True)
+            
+            for signup in batch:
+                view = ReviewActionView(self.event_id, signup.user_id, interaction.message, signup.requested_role)
+                await interaction.followup.send(f"**{signup.display_name}** applied for **{signup.requested_role}**:", view=view, ephemeral=True)

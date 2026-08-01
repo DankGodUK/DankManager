@@ -52,6 +52,7 @@ class PresetSlot(Base):
     role_name: Mapped[str] = mapped_column(String)
     count: Mapped[int] = mapped_column(Integer)
     order: Mapped[int] = mapped_column(Integer, default=0)  # display / fill priority order
+    role_type: Mapped[str] = mapped_column(String, default="DPS")
     notes: Mapped[str | None] = mapped_column(String, nullable=True)  # gear/spec notes
 
     preset: Mapped["BuildPreset"] = relationship(back_populates="slots")

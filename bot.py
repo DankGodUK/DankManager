@@ -27,6 +27,7 @@ COGS = [
     "cogs.events",
     "cogs.parties",
     "cogs.reminders",
+    "cogs.manager",
 ]
 
 
@@ -62,4 +63,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot shut down gracefully.")

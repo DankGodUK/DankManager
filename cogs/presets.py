@@ -64,6 +64,8 @@ async def apply_bulk_roles(guild_id: int, preset_name: str, roles_text: str) -> 
             existing = next((s for s in p.slots if s.role_name.lower() == entry["role"].lower()), None)
             if existing:
                 existing.count = entry["count"]
+                if "type" in entry and entry["type"] != existing.role_type:
+                    existing.role_type = entry["type"]
                 if entry["notes"] is not None:
                     existing.notes = entry["notes"]
                 updated.append(f"{existing.role_name} x{existing.count}")
@@ -72,6 +74,7 @@ async def apply_bulk_roles(guild_id: int, preset_name: str, roles_text: str) -> 
                     preset_id=p.id,
                     role_name=entry["role"],
                     count=entry["count"],
+                    role_type=entry.get("type", "DPS"),
                     order=len(p.slots) + len(added),
                     notes=entry["notes"],
                 )
@@ -104,7 +107,8 @@ class BulkAddSlotModal(discord.ui.Modal, title="Bulk add roles"):
     roles = discord.ui.TextInput(
         label="One role per line",
         style=discord.TextStyle.paragraph,
-        placeholder="Great Hammer Kite x4\nHealer x8 | full dive spec\nLocksman x2\nFrost Mage x6",
+        placeholder="[Tank] Great Hammer Kite x4\n[Healer] Healer x8 | full dive spec\nLocksman x2",
+        default="[Tank] Great Hammer Kite x4\n[Healer] Healer x8 | full dive spec\nLocksman x2",
         required=True,
         max_length=4000,
     )
@@ -114,14 +118,27 @@ class BulkAddSlotModal(discord.ui.Modal, title="Bulk add roles"):
         await interaction.response.send_message(message, ephemeral=True)
 
 
+
+class PresetCreateSuccessView(discord.ui.View):
+    def __init__(self, guild_id: int, preset_name: str):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.preset_name = preset_name
+        
+    @discord.ui.button(label="Bulk Add Slots", style=discord.ButtonStyle.primary, emoji="📋")
+    async def bulk_add(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Local import to avoid circular dependency issues if any, although BulkAddSlotModal is in the same file.
+        await interaction.response.send_modal(BulkAddSlotModal(self.guild_id, self.preset_name))
+
+
 class PresetCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    preset_group = app_commands.Group(name="preset", description="Manage reusable build sheet presets")
+    preset_group = app_commands.Group(name="preset", description="Manage reusable build presets for events")
 
-    @preset_group.command(name="create", description="Create a new build preset (e.g. 'Clap Kite', 20-man)")
-    @app_commands.describe(name="Preset name", size="Total headcount for this build (4-40)")
+    @preset_group.command(name="create", description="Create an empty build preset, e.g. 'ZVZ Core' (20-man)")
+    @app_commands.describe(name="Name of the preset", size="Expected size of the group")
     async def create(self, interaction: discord.Interaction, name: str, size: app_commands.Range[int, 4, 40]):
         async with async_session() as session:
             existing = await session.execute(
@@ -135,14 +152,23 @@ class PresetCog(commands.Cog):
             session.add(preset)
             await session.commit()
 
+        view = PresetCreateSuccessView(interaction.guild_id, name)
         await interaction.response.send_message(
-            f"✅ Created preset **{name}** ({size}-man). Now add roles with `/preset addslot` or `/preset bulkaddslot`.",
+            f"✅ Created preset **{name}** ({size}-man). Click below to bulk-add roles, or use `/preset addslot`.",
+            view=view,
             ephemeral=True,
         )
 
+
     @preset_group.command(name="addslot", description="Add a single role line to a preset, e.g. 'Great Hammer Kite' x4")
-    @app_commands.describe(preset="Preset name", role="Role/build name", count="How many players in this role", notes="Optional gear/spec notes")
-    async def addslot(self, interaction: discord.Interaction, preset: str, role: str, count: app_commands.Range[int, 1, 40], notes: str = None):
+    @app_commands.describe(preset="Preset name", role="Role/build name", role_type="Tank, DPS, Healer, Support", count="How many players in this role", notes="Optional gear/spec notes")
+    @app_commands.choices(role_type=[
+        app_commands.Choice(name="Tank", value="Tank"),
+        app_commands.Choice(name="DPS", value="DPS"),
+        app_commands.Choice(name="Healer", value="Healer"),
+        app_commands.Choice(name="Support", value="Support"),
+    ])
+    async def addslot(self, interaction: discord.Interaction, preset: str, role: str, count: app_commands.Range[int, 1, 40], role_type: app_commands.Choice[str], notes: str = None):
         async with async_session() as session:
             result = await session.execute(
                 select(BuildPreset)
@@ -155,7 +181,7 @@ class PresetCog(commands.Cog):
                 return
 
             new_total = slots_total(p) + count
-            slot = PresetSlot(preset_id=p.id, role_name=role, count=count, order=len(p.slots), notes=notes)
+            slot = PresetSlot(preset_id=p.id, role_name=role, role_type=role_type.value, count=count, order=len(p.slots), notes=notes)
             session.add(slot)
             await session.commit()
 
