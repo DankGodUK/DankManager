@@ -1,0 +1,8 @@
+discord.py>=2.4.0
+SQLAlchemy>=2.0.30
+aiosqlite>=0.20.0
+python-dotenv>=1.0.1
+python-dateutil>=2.9.0
+
+# For future Postgres migration, uncomment:
+# asyncpg>=0.29.0
